@@ -1,0 +1,1 @@
+# sava-rachynskyi-aws-cloudformation-wordpress
