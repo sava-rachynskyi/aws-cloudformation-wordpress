@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WordPress-aws-Project
+
+Parameters:
+  EnvType:
+    Type: String
+    Default: TEST
+    AllowedValues: [TEST, DEVELOPER, PRODUCTION]
+
+Mappings:
+  EnvConfig:
+    TEST: {VMType: "t3.micro", DBMultiAZ: "false", ASGMin: "1", ASGMax: "3"}
+    DEVELOPER: {VMType: "t3.small", DBMultiAZ: "false", ASGMin: "2", ASGMax: "3"}
+    PRODUCTION: {VMType: "t3.medium", DBMultiAZ: "true", ASGMin: "2", ASGMax: "6"}
+    
+  # --- 10. Multi-region suport ---
+  RegionMap:
+    us-east-1: {AMI: "ami-0c101f26f147fa7fd"}
+    us-east-2: {AMI: "ami-09040d770ffe2224f"}
+    us-west-2: {AMI: "ami-00563078bca04e287"}
+
+Resources:
+  # --- 1. NETWORK ---
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "WP-VPC-${EnvType}"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref MyVPC, InternetGatewayId: !Ref InternetGateway}
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties: {Domain: vpc}
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PubSub1
+
+  PubSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      MapPublicIpOnLaunch: true
+
+  PubSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      MapPublicIpOnLaunch: true
+
+  PrivSub1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.1.10.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+
+  PrivSub2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.1.11.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref MyVPC}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PublicRouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway}
+  
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref MyVPC}
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties: {RouteTableId: !Ref PrivateRouteTable, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGateway}
+
+  Assoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub1, RouteTableId: !Ref PublicRouteTable}
+  Assoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PubSub2, RouteTableId: !Ref PublicRouteTable}
+  Assoc3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub1, RouteTableId: !Ref PrivateRouteTable}
+  Assoc4:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref PrivSub2, RouteTableId: !Ref PrivateRouteTable}
+
+  # --- 2. BASTION HOST ---
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0}]
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      SubnetId: !Ref PubSub1
+      SecurityGroupIds: [!Ref BastionSG]
+      Tags: [{Key: Name, Value: "Bastion-Host"}]
+
+  # --- 3. EFS ---
+  WordPressEFS:
+    Type: AWS::EFS::FileSystem
+    Properties: {FileSystemTags: [{Key: Name, Value: "WP-Shared-Files"}]}
+  
+  EFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: {FileSystemId: !Ref WordPressEFS, SubnetId: !Ref PrivSub1, SecurityGroups: [!Ref EFSSG]}
+
+  EFSMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: {FileSystemId: !Ref WordPressEFS, SubnetId: !Ref PrivSub2, SecurityGroups: [!Ref EFSSG]}
+  
+  EFSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS SG
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 2049, ToPort: 2049, CidrIp: 10.1.0.0/16}]
+
+  # --- 4. DATABASE ---
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: RDS Subnets, SubnetIds: [ !Ref PrivSub1, !Ref PrivSub2 ]}
+
+  WordPressDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: wordpress
+      Engine: mysql
+      MasterUsername: admin
+      MasterUserPassword: Password123
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: !FindInMap [EnvConfig, !Ref EnvType, DBMultiAZ]
+      VPCSecurityGroups: [!Ref DBSG]
+
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB access
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 3306, ToPort: 3306, CidrIp: 10.1.0.0/16}]
+
+  # --- 5. APPLICATION LOAD BALANCER ---
+  ALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0}]
+
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Tier SG
+      VpcId: !Ref MyVPC
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref ALBSG}
+        - {IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !Ref BastionSG}
+
+  MyALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: [ !Ref PubSub1, !Ref PubSub2 ]
+      SecurityGroups: [ !Ref ALBSG ]
+
+  MyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions: [{Type: forward, TargetGroupArn: !Ref MyTargetGroup}]
+      LoadBalancerArn: !Ref MyALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- 6. AUTOSCALING GROUP WITH AUTOMATIC WORDPRESS INSTALLATION ---
+  WPLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !FindInMap [EnvConfig, !Ref EnvType, VMType]
+        ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+        SecurityGroupIds: [!Ref WebSG]
+        UserData:
+          Fn::Base64: !Sub 
+            - |
+              #!/bin/bash
+              yum install -y httpd wget amazon-efs-utils php php-mysqlnd php-gd php-xml php-mbstring php-json -y
+              systemctl start httpd
+              systemctl enable httpd
+
+              mkdir -p /var/www/html
+              mount -t efs ${EfsId}:/ /var/www/html || true
+
+              chown -R apache:apache /var/www/html
+              chmod -R 775 /var/www/html
+
+              if [ ! -f /var/www/html/wp-config.php ]; then
+                cd /tmp
+                wget https://wordpress.org/latest.tar.gz
+                tar -xzf latest.tar.gz
+                cp -r wordpress/* /var/www/html/
+
+                cd /var/www/html
+                cp wp-config-sample.php wp-config.php
+                sed -i "s/database_name_here/wordpress/g" wp-config.php
+                sed -i "s/username_here/admin/g" wp-config.php
+                sed -i "s/password_here/Password123/g" wp-config.php
+                sed -i "s/localhost/${DbEndpoint}/g" wp-config.php
+                echo -e "\n// MyProject" >> wp-config.php
+              fi
+
+              chown -R apache:apache /var/www/html
+              chmod -R 775 /var/www/html
+              systemctl restart httpd
+            - { EfsId: !Ref WordPressEFS, DbEndpoint: !GetAtt WordPressDB.Endpoint.Address }
+
+  WPASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WPLaunchTemplate
+        Version: !GetAtt WPLaunchTemplate.LatestVersionNumber
+      MaxSize: !FindInMap [EnvConfig, !Ref EnvType, ASGMax]
+      MinSize: !FindInMap [EnvConfig, !Ref EnvType, ASGMin]
+      VPCZoneIdentifier: [!Ref PrivSub1, !Ref PrivSub2]
+      TargetGroupARNs:
+        - !Ref MyTargetGroupFinal
+
+  # --- 7. AUTOSCALING POLICY ---
+  WPScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WPASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+Outputs:
+  WebsiteURL:
+    Description: WordPress Access URL
+    Value: !Sub "http://${MyALBFinal.DNSName}"
